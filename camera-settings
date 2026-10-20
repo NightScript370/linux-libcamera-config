@@ -1,0 +1,315 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""Camera Settings: picture controls for a libcamera webcam served by v4l2-relayd.
+
+Without arguments it opens a window with a live preview and sliders.
+With arguments it works from a terminal:
+    camera-settings --show
+    camera-settings --saturation 1.2 --contrast 1.1 --gamma 2.2
+    camera-settings --reset
+    camera-settings --restart
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+CONFIG = "/etc/v4l2-relayd"
+HELPER = "/usr/local/libexec/camera-settings-apply"
+# Runtime-PM state of the camera sensor(s); "active" means some app is streaming.
+SENSOR_POWER_GLOB = "/sys/bus/i2c/devices/i2c-OVTI*/power/runtime_status"
+GST_PLUGINS = "/opt/libcamera/lib/x86_64-linux-gnu/gstreamer-1.0"
+
+# name: (label, minimum, maximum, step, default, help)
+SETTINGS = {
+    "saturation": ("Saturation", 0.0, 2.0, 0.05, 1.0, "How vivid colors are. 0 is black and white."),
+    "contrast": ("Contrast", 0.5, 2.0, 0.05, 1.15, "Difference between dark and bright areas."),
+    "gamma": ("Gamma", 1.0, 3.0, 0.05, 2.2, "Higher brightens shadows and mid-tones."),
+}
+DEFAULTS = {k: v[4] for k, v in SETTINGS.items()}
+
+
+def read_settings():
+    """Current values from the webcam service config, defaults for anything missing."""
+    values = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            line = next((l for l in f if l.startswith("VIDEOSRC=")), "")
+    except OSError:
+        return values
+    for key in SETTINGS:
+        m = re.search(rf"\b{key}=([0-9.]+)", line)
+        if m:
+            values[key] = float(m.group(1))
+    return values
+
+
+def clamp(key, value):
+    _, lo, hi, _, _, _ = SETTINGS[key]
+    return round(min(max(value, lo), hi), 2)
+
+
+def run_helper(*args):
+    """Runs the privileged helper through pkexec; returns (ok, message)."""
+    try:
+        r = subprocess.run(["pkexec", HELPER, *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    if r.returncode == 0:
+        return True, r.stdout.strip()
+    return False, (r.stderr or r.stdout).strip() or f"helper failed ({r.returncode})"
+
+
+def save(values):
+    return run_helper("set", *(f"{values[k]:.2f}" for k in SETTINGS))
+
+
+def camera_in_use():
+    import glob
+    for path in glob.glob(SENSOR_POWER_GLOB):
+        try:
+            with open(path) as f:
+                if f.read().strip() == "active":
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+# ---------------------------------------------------------------- command line
+
+def cli(argv):
+    p = argparse.ArgumentParser(prog="camera-settings", description="Adjust the built-in camera's picture.")
+    for key, (label, lo, hi, _, default, help_) in SETTINGS.items():
+        p.add_argument(f"--{key}", type=float, metavar="N", help=f"{help_} Range {lo}-{hi}, default {default}.")
+    p.add_argument("--show", action="store_true", help="print the current settings")
+    p.add_argument("--reset", action="store_true", help="restore the default settings")
+    p.add_argument("--restart", action="store_true", help="restart the camera service (if the camera gets stuck)")
+    a = p.parse_args(argv)
+
+    if a.show:
+        for key, value in read_settings().items():
+            print(f"{SETTINGS[key][0]:<11} {value:.2f}")
+        return 0
+    if a.restart:
+        ok, msg = run_helper("restart")
+        print("Camera service restarted." if ok else f"Failed: {msg}")
+        return 0 if ok else 1
+
+    values = dict(DEFAULTS) if a.reset else read_settings()
+    for key in SETTINGS:
+        if getattr(a, key) is not None:
+            values[key] = clamp(key, getattr(a, key))
+    ok, msg = save(values)
+    if not ok:
+        print(f"Failed: {msg}", file=sys.stderr)
+        return 1
+    print("Saved: " + ", ".join(f"{k} {v:.2f}" for k, v in values.items()))
+    return 0
+
+
+# ---------------------------------------------------------------------- window
+
+def gui():
+    # libcamera built into /opt (as the ov05c10-ipu6-cvs installer does); a distro
+    # libcamera's GStreamer plugin is found without this.
+    if os.path.isdir(GST_PLUGINS):
+        os.environ["GST_PLUGIN_PATH"] = GST_PLUGINS + (":" + os.environ["GST_PLUGIN_PATH"] if os.environ.get("GST_PLUGIN_PATH") else "")
+    os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:ERROR")
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gst", "1.0")
+    from gi.repository import GLib, Gst, Gtk
+
+    Gst.init(None)
+
+    class Window(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="Camera Settings")
+            self.set_default_size(720, 640)
+            self.set_icon_name("camera-web")
+            self.saved = read_settings()
+            self.pending = None
+            self.pipeline = None
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=16)
+            self.add(box)
+
+            # Preview area: the video widget, or a message when the camera is busy.
+            self.stack = Gtk.Stack()
+            self.stack.set_size_request(640, 360)
+            self.message = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+            msg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.CENTER)
+            msg_box.pack_start(self.message, False, False, 0)
+            retry = Gtk.Button(label="Show preview", halign=Gtk.Align.CENTER)
+            retry.connect("clicked", lambda *_: self.start_preview())
+            msg_box.pack_start(retry, False, False, 0)
+            self.stack.add_named(msg_box, "message")
+            self.sink = Gst.ElementFactory.make("gtksink")
+            if self.sink:
+                self.stack.add_named(self.sink.props.widget, "video")
+            box.pack_start(self.stack, True, True, 0)
+
+            grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+            self.scales = {}
+            for row, (key, (label, lo, hi, step, _, help_)) in enumerate(SETTINGS.items()):
+                name = Gtk.Label(label=label, xalign=0)
+                name.set_tooltip_text(help_)
+                scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+                scale.set_hexpand(True)
+                scale.set_digits(2)
+                scale.set_value(self.saved[key])
+                scale.set_tooltip_text(help_)
+                scale.connect("value-changed", self.on_changed)
+                grid.attach(name, 0, row, 1, 1)
+                grid.attach(scale, 1, row, 1, 1)
+                self.scales[key] = scale
+            box.pack_start(grid, False, False, 0)
+
+            buttons = Gtk.Box(spacing=8)
+            reset = Gtk.Button(label="Reset to defaults")
+            reset.connect("clicked", self.on_reset)
+            restart = Gtk.Button(label="Restart camera")
+            restart.set_tooltip_text("Use this if the camera stops working in other apps.")
+            restart.connect("clicked", self.on_restart)
+            self.save_button = Gtk.Button(label="Save")
+            self.save_button.get_style_context().add_class("suggested-action")
+            self.save_button.set_tooltip_text("Use these settings in all apps (video calls, browser, etc.).")
+            self.save_button.connect("clicked", self.on_save)
+            buttons.pack_start(reset, False, False, 0)
+            buttons.pack_start(restart, False, False, 0)
+            buttons.pack_end(self.save_button, False, False, 0)
+            box.pack_start(buttons, False, False, 0)
+
+            self.status = Gtk.Label(xalign=0, wrap=True)
+            box.pack_start(self.status, False, False, 0)
+
+            self.connect("destroy", self.on_destroy)
+            self.update_save_state()
+            self.show_all()
+            GLib.idle_add(self.start_preview)
+
+        # -- values
+        def values(self):
+            return {k: round(s.get_value(), 2) for k, s in self.scales.items()}
+
+        def update_save_state(self):
+            changed = self.values() != {k: round(v, 2) for k, v in self.saved.items()}
+            self.save_button.set_sensitive(changed)
+            if changed:
+                self.status.set_text("Not saved yet. Other apps still use the old settings.")
+
+        # -- preview
+        def show_message(self, text):
+            self.stop_preview()
+            self.message.set_text(text)
+            self.stack.set_visible_child_name("message")
+
+        def start_preview(self):
+            self.pending = None
+            self.stop_preview()
+            if not self.sink:
+                self.show_message("Preview is unavailable (GStreamer GTK support is missing).\nSettings can still be saved.")
+                return False
+            if camera_in_use():
+                self.show_message("The camera is being used by another app, such as a video call.\n"
+                                  "Close it to see a preview. Settings can still be saved.")
+                return False
+            v = self.values()
+            src = Gst.ElementFactory.make("libcamerasrc")
+            if not src:
+                self.show_message("The camera software (libcamera) could not be loaded.")
+                return False
+            for key, value in v.items():
+                src.set_property(key, value)
+            caps = Gst.ElementFactory.make("capsfilter")
+            caps.set_property("caps", Gst.Caps.from_string("video/x-raw,width=1280,height=720"))
+            conv = Gst.ElementFactory.make("videoconvert")
+            self.pipeline = Gst.Pipeline.new("preview")
+            for e in (src, caps, conv, self.sink):
+                self.pipeline.add(e)
+            src.link(caps)
+            caps.link(conv)
+            conv.link(self.sink)
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message::error", self.on_error)
+            self.pipeline.set_state(Gst.State.PLAYING)
+            self.stack.set_visible_child_name("video")
+            return False
+
+        def stop_preview(self):
+            if self.pipeline:
+                self.pipeline.get_bus().remove_signal_watch()
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline.remove(self.sink)  # the sink widget is reused by the next pipeline
+                self.pipeline = None
+
+        def on_error(self, _bus, msg):
+            err, _ = msg.parse_error()
+            self.show_message(f"The preview stopped: {err.message}\n"
+                              "If another app is using the camera, close it and try again.")
+
+        # -- handlers
+        def on_changed(self, *_):
+            self.update_save_state()
+            # libcamera only applies these when the stream starts, so restart the
+            # preview shortly after the last slider movement.
+            if self.pending:
+                GLib.source_remove(self.pending)
+            self.pending = GLib.timeout_add(450, self.start_preview)
+
+        def on_reset(self, *_):
+            for key, scale in self.scales.items():
+                scale.set_value(DEFAULTS[key])
+
+        def run_privileged(self, busy_text, func, done):
+            self.status.set_text(busy_text)
+            self.set_sensitive(False)
+            was_previewing = self.pipeline is not None
+            self.stop_preview()  # free the camera while the service restarts
+
+            def worker():
+                ok, msg = func()
+                GLib.idle_add(finish, ok, msg)
+
+            def finish(ok, msg):
+                self.set_sensitive(True)
+                done(ok, msg)
+                if was_previewing:
+                    GLib.timeout_add(1500, self.start_preview)
+                return False
+
+            import threading
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_save(self, *_):
+            v = self.values()
+
+            def done(ok, msg):
+                if ok:
+                    self.saved = v
+                    self.update_save_state()
+                    self.status.set_text("Saved. All apps now use these settings "
+                                         "(an app that was already showing the camera may need to reopen it).")
+                else:
+                    self.status.set_text(f"Could not save: {msg}")
+            self.run_privileged("Saving…", lambda: save(v), done)
+
+        def on_restart(self, *_):
+            def done(ok, msg):
+                self.status.set_text("Camera service restarted." if ok else f"Could not restart: {msg}")
+            self.run_privileged("Restarting the camera service…", lambda: run_helper("restart"), done)
+
+        def on_destroy(self, *_):
+            self.stop_preview()
+            Gtk.main_quit()
+
+    Window()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli(sys.argv[1:]) if len(sys.argv) > 1 else gui())

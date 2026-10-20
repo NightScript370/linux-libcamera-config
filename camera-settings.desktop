@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Camera Settings
+GenericName=Webcam Settings
+Comment=Adjust the colors of the built-in camera
+Exec=camera-settings
+Icon=camera-web
+Terminal=false
+Categories=Settings;HardwareSettings;GTK;
+Keywords=camera;webcam;video;color;saturation;contrast;

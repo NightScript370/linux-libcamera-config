@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Privileged helper for camera-settings (run via pkexec).
+#   camera-settings-apply set SATURATION CONTRAST GAMMA
+#   camera-settings-apply restart
+# Only accepts plain numbers inside fixed ranges, so it can't be used to write anything else.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+config=/etc/v4l2-relayd
+
+in_range() { # value min max
+	printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || return 1
+	awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(v >= lo && v <= hi) }'
+}
+
+case "${1:-}" in
+set)
+	[ $# -eq 4 ] || { echo "usage: $0 set SATURATION CONTRAST GAMMA" >&2; exit 2; }
+	in_range "$2" 0 2 || { echo "saturation must be 0-2" >&2; exit 2; }
+	in_range "$3" 0.5 2 || { echo "contrast must be 0.5-2" >&2; exit 2; }
+	in_range "$4" 1 3 || { echo "gamma must be 1-3" >&2; exit 2; }
+	[ -f "$config" ] || { echo "$config is missing; is the camera set up?" >&2; exit 1; }
+	line="VIDEOSRC=\"libcamerasrc saturation=$2 contrast=$3 gamma=$4 ! video/x-raw,width=1280,height=720 ! videoconvert\""
+	tmp=$(mktemp "$config.XXXXXX")
+	if grep -q '^VIDEOSRC=' "$config"; then
+		sed "s|^VIDEOSRC=.*|$line|" "$config" > "$tmp"
+	else
+		{ cat "$config"; echo "$line"; } > "$tmp"
+	fi
+	chmod 644 "$tmp"
+	mv "$tmp" "$config"
+	systemctl restart v4l2-relayd
+	echo "saved"
+	;;
+restart)
+	systemctl restart v4l2-relayd
+	echo "restarted"
+	;;
+*)
+	echo "usage: $0 set SATURATION CONTRAST GAMMA | restart" >&2
+	exit 2
+	;;
+esac
